@@ -36,9 +36,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import org.apache.commons.cli.UnrecognizedOptionException;
 import org.apache.commons.lang3.Range;
+import org.apache.hadoop.yarn.server.cache.AppsCacheKey;
+import org.apache.hadoop.yarn.server.cache.CacheNode;
+import org.apache.hadoop.yarn.server.cache.LRUCache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -243,6 +247,12 @@ public class ClientRMService extends AbstractService implements
   private ResourceProfilesManager resourceProfilesManager;
   private boolean timelineServiceV2Enabled;
 
+  // apps cache
+  private volatile LRUCache<AppsCacheKey, CacheNode<List<ApplicationReport>>> appsLRUCache;
+  private AtomicLong getAppsSuccessTimes = new AtomicLong(0);
+  private AtomicLong hitAppsCacheTimes = new AtomicLong(0);
+  private volatile boolean enableAppsCache;
+
   public ClientRMService(RMContext rmContext, YarnScheduler scheduler,
       RMAppManager rmAppManager, ApplicationACLsManager applicationACLsManager,
       QueueACLsManager queueACLsManager,
@@ -266,6 +276,12 @@ public class ClientRMService extends AbstractService implements
     this.clock = clock;
     this.rValidator = new ReservationInputValidator(clock);
     resourceProfilesManager = rmContext.getResourceProfilesManager();
+    this.enableAppsCache = rmContext.getYarnConfiguration().getBoolean(YarnConfiguration.APPS_CACHE_ENABLE, YarnConfiguration.DEFAULT_APPS_CACHE_ENABLE);
+    if (enableAppsCache) {
+      int cacheSize = rmContext.getYarnConfiguration().getInt(YarnConfiguration.APPS_CACHE_SIZE, YarnConfiguration.DEFAULT_APPS_CACHE_SIZE);
+      int appsCacheTimeMs = rmContext.getYarnConfiguration().getInt(YarnConfiguration.APPS_CACHE_TIME_MS, YarnConfiguration.DEFAULT_APPS_CACHE_TIME_MS);
+      appsLRUCache = new LRUCache<>(cacheSize, appsCacheTimeMs);
+    }
   }
 
   @Override
@@ -885,6 +901,28 @@ public class ClientRMService extends AbstractService implements
     ApplicationsRequestScope scope = request.getScope();
     String name = request.getName();
 
+    AppsCacheKey cacheKey = new AppsCacheKey(scope, users, queues, applicationTypes, tags,
+        applicationStates, start, finish, limit, callerUGI);
+    if (this.enableAppsCache) {
+      long t1 = hitAppsCacheTimes.get();
+      long t2 = getAppsSuccessTimes.get();
+      LOG.debug("cacheKey=" + cacheKey);
+      // print hitAppsCacheTimes per 1000 getApps
+      if (t2 % 1000 == 0) {
+        LOG.info("hit cache info: getAppsSuccessTimes={}, hitAppsCacheTimes={}", t2, t1);
+      }
+      CacheNode<List<ApplicationReport>> node = appsLRUCache.get(cacheKey);
+      if (node != null) {
+        hitAppsCacheTimes.getAndIncrement();
+        getAppsSuccessTimes.getAndIncrement();
+        GetApplicationsResponse response =
+            recordFactory.newRecordInstance(GetApplicationsResponse.class);
+        List<ApplicationReport> applicationReports = node.get();
+        response.setApplicationList(applicationReports);
+        return response;
+      }
+    }
+
     final Map<ApplicationId, RMApp> apps = rmContext.getRMApps();
     final Set<ApplicationId> runningAppsFilteredByQueues =
         getRunningAppsFilteredByQueues(apps, queues);
@@ -979,6 +1017,10 @@ public class ClientRMService extends AbstractService implements
     GetApplicationsResponse response =
       recordFactory.newRecordInstance(GetApplicationsResponse.class);
     response.setApplicationList(reports);
+    if(enableAppsCache){
+      appsLRUCache.put(cacheKey, new CacheNode<>(reports));
+      getAppsSuccessTimes.getAndIncrement();
+    }
     return response;
   }
 
